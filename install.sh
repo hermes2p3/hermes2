@@ -2,17 +2,19 @@
 # ============================================================
 #  Hermes Studio + 9Router - Automated installer for Daytona
 # ============================================================
-#  Version: 1.0
+#  Version: 1.1
 #  License: MIT
 # ============================================================
 #
 #  This script automatically installs and configures:
+#  - System prerequisites (curl, git, build tools, cron, ...)
 #  - Node.js 24
 #  - Python 3.12
 #  - hermes-agent
 #  - Hermes Studio (AI chat web UI)
 #  - 9Router (free AI model API router)
-#  - Telegram channel (bot token + owner pairing)
+#  - Telegram channel (bot token + owner pairing) - env vars OR
+#    an interactive prompt if you don't set them beforehand
 #  - Skills & plugins for hermes-agent
 #  - Automatic watchdog / self-healing system
 #
@@ -20,8 +22,9 @@
 #    bash install.sh
 #
 #  Optional environment variables (set before running to auto-configure
-#  the Telegram channel and pre-install skills; all are optional and
-#  can also be filled in later from the Hermes Studio "channels" tab):
+#  the Telegram channel and pre-install skills, non-interactively;
+#  if TELEGRAM_BOT_TOKEN is not set and the script is running in an
+#  interactive terminal, it will ask you instead):
 #    TELEGRAM_BOT_TOKEN         Bot token from https://t.me/BotFather
 #    TELEGRAM_OWNER_ID          Your numeric Telegram user ID. The owner
 #                               is auto-approved for the first pairing
@@ -34,6 +37,8 @@
 #    TELEGRAM_MENTION_PATTERNS  Comma-separated extra trigger patterns
 #    HERMES_SKILLS              Comma-separated skill/plugin sources to
 #                               install, e.g. a GitHub repo per entry
+#    SKIP_TELEGRAM_PROMPT       true - never ask interactively, just skip
+#                               Telegram setup if env vars aren't set
 #
 #  Example:
 #    TELEGRAM_BOT_TOKEN="123:ABC" TELEGRAM_OWNER_ID="5839201773" \
@@ -64,6 +69,20 @@ info()  { echo -e "${CYAN}[$(date '+%H:%M:%S')] ℹ $1${NC}"; }
 # Run a command and give a clear error message on failure
 run() { "$@" || error "Command failed: $*"; }
 
+# Read a line from the real terminal even when the script itself is
+# being fed via a pipe (e.g. `curl ... | bash`), so interactive
+# prompts still work. Falls back silently (empty answer) if there is
+# no terminal attached at all (e.g. run from CI/cron).
+ask() {
+    local prompt="$1" __resultvar="$2" default="${3:-}" answer=""
+    if [ -r /dev/tty ]; then
+        # shellcheck disable=SC2162
+        read -r -p "$prompt" answer < /dev/tty || answer=""
+    fi
+    [ -z "$answer" ] && answer="$default"
+    printf -v "$__resultvar" '%s' "$answer"
+}
+
 # --- Variables ---
 PYTHON_VERSION="3.12.13"
 PYTHON_BUILD_DATE="20260623"
@@ -81,6 +100,7 @@ TELEGRAM_REQUIRE_MENTION="${TELEGRAM_REQUIRE_MENTION:-false}"
 TELEGRAM_REACTIONS="${TELEGRAM_REACTIONS:-true}"
 TELEGRAM_FREE_CHATS="${TELEGRAM_FREE_CHATS:-}"
 TELEGRAM_MENTION_PATTERNS="${TELEGRAM_MENTION_PATTERNS:-}"
+SKIP_TELEGRAM_PROMPT="${SKIP_TELEGRAM_PROMPT:-false}"
 
 # --- Skills & plugins to pre-install (comma-separated) ---
 HERMES_SKILLS="${HERMES_SKILLS:-}"
@@ -109,6 +129,54 @@ fi
 
 SANDBOX_ID=${DAYTONA_SANDBOX_ID:-$(hostname)}
 info "Sandbox ID: ${SANDBOX_ID}"
+
+# ============================================================
+# Step 0: Install system prerequisites
+# ============================================================
+echo ""
+log "━━━ Step 0: Install system prerequisites ━━━"
+
+# Every tool the rest of the script depends on (curl for downloads,
+# git/build tools for cloning + native modules, cron/psmisc/procps for
+# the watchdog, ca-certificates so HTTPS downloads don't fail on a
+# bare image). Installed up front, in one shot, instead of being
+# discovered missing halfway through a later step.
+REQUIRED_PKGS=(
+    ca-certificates
+    curl
+    wget
+    git
+    make
+    g++
+    python3-dev
+    cron
+    psmisc     # provides fuser, used by the watchdog
+    procps     # provides pgrep/pkill
+    tar
+    gzip
+    unzip
+    gnupg
+)
+
+MISSING_PKGS=()
+for pkg in "${REQUIRED_PKGS[@]}"; do
+    if ! dpkg -s "$pkg" &>/dev/null; then
+        MISSING_PKGS+=("$pkg")
+    fi
+done
+
+if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
+    log "Installing missing prerequisites: ${MISSING_PKGS[*]}"
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${MISSING_PKGS[@]}" > /dev/null \
+        || error "Failed to install prerequisites: ${MISSING_PKGS[*]}"
+    log "Prerequisites installed."
+else
+    info "All system prerequisites are already installed."
+fi
+
+# Sanity check: curl must be present before we try to use it below.
+command -v curl &>/dev/null || error "curl is still missing after installation attempt - aborting."
 
 # ============================================================
 # Step 1: Install Node.js
@@ -164,14 +232,6 @@ else
     /opt/hermes-venv/bin/pip install 'hermes-agent>=0.18' -q
     ln -sf /opt/hermes-venv/bin/hermes /usr/local/bin/hermes
     log "hermes-agent installed: $(/opt/hermes-venv/bin/hermes --version 2>&1 | head -1)"
-fi
-
-# Install system tools (only if missing, to avoid an unconditional apt run every time)
-if ! command -v cron &>/dev/null || ! command -v git &>/dev/null || ! command -v make &>/dev/null; then
-    log "Installing system tools (cron, curl, git, build tools)..."
-    apt-get update -qq && apt-get install -y -qq cron curl git make g++ python3-dev > /dev/null 2>&1 || warn "Some system packages may not have installed correctly."
-else
-    info "System tools already installed."
 fi
 
 # ============================================================
@@ -285,6 +345,34 @@ fi
 echo ""
 log "━━━ Step 8: Configure Telegram channel ━━━"
 
+# If no bot token was passed in via env vars, offer to ask for it
+# interactively instead of just silently skipping. Uses /dev/tty so
+# this still works when the script itself is piped in (curl | bash).
+if [ -z "$TELEGRAM_BOT_TOKEN" ] && [ "$SKIP_TELEGRAM_PROMPT" != "true" ] && [ -r /dev/tty ]; then
+    setup_choice=""
+    ask "Configure a Telegram channel now? [y/N]: " setup_choice "n"
+    case "$setup_choice" in
+        y|Y|yes|YES)
+            ask "Telegram bot token (from @BotFather): " TELEGRAM_BOT_TOKEN ""
+            if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+                ask "Your numeric Telegram user ID (owner, optional but recommended): " TELEGRAM_OWNER_ID ""
+                ask "Proxy URL (optional, press Enter to skip): " TELEGRAM_PROXY_URL ""
+                ask "Require @mention in group chats? [y/N]: " require_answer "n"
+                case "$require_answer" in y|Y|yes|YES) TELEGRAM_REQUIRE_MENTION="true";; *) TELEGRAM_REQUIRE_MENTION="false";; esac
+                ask "Enable emoji reactions? [Y/n]: " reactions_answer "y"
+                case "$reactions_answer" in n|N|no|NO) TELEGRAM_REACTIONS="false";; *) TELEGRAM_REACTIONS="true";; esac
+            else
+                warn "No token entered - skipping Telegram setup."
+            fi
+            ;;
+        *)
+            info "Skipping interactive Telegram setup."
+            ;;
+    esac
+elif [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+    info "No TELEGRAM_BOT_TOKEN and no interactive terminal available - skipping Telegram prompt."
+fi
+
 if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
     mkdir -p /root/.hermes/channels
 
@@ -319,7 +407,7 @@ EOF
         warn "TELEGRAM_OWNER_ID not set - pairing requests will need manual approval via 'hermes pairing approve telegram <code>'."
     fi
 else
-    info "TELEGRAM_BOT_TOKEN not set - skipping Telegram channel setup. You can configure it later from the Hermes Studio channels tab."
+    info "Telegram channel not configured. You can set it up later from the Hermes Studio channels tab, or re-run with TELEGRAM_BOT_TOKEN set."
 fi
 
 # ============================================================
@@ -562,7 +650,15 @@ if ! pgrep -x cron > /dev/null; then
 fi
 
 # --- Set up crontab ---
-(crontab -l 2>/dev/null | grep -v 'check-watchdog'; echo '*/10 * * * * /usr/local/bin/check-watchdog.sh') | crontab -
+# BUG FIX: with `set -e`/`pipefail` active, `crontab -l` exits non-zero
+# the very first time (no crontab exists yet for root), and piping
+# that straight into `grep -v` (which also exits 1 when it has no
+# input to match against) used to kill this whole statement before the
+# `echo` line ever ran - so `crontab -` received empty input and the
+# watchdog cron job was silently never installed. Wrapping the failing
+# commands with `|| true` stops `set -e` from aborting the pipeline.
+{ crontab -l 2>/dev/null | grep -v 'check-watchdog' || true; \
+  echo '*/10 * * * * /usr/local/bin/check-watchdog.sh'; } | crontab -
 log "Cron configured: watchdog checked every 10 minutes."
 
 # --- Start Watchdog ---
