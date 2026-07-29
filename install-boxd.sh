@@ -20,7 +20,7 @@
 #   - There is no proxy-URL-with-port-in-the-hostname scheme. A
 #     boxd VM gets exactly one default HTTPS proxy for one port
 #     (https://<name>.boxd.sh -> :8000 by default). Extra ports need
-#     an explicit subdomain proxy via `boxd machine proxy add`. This
+#     an explicit subdomain proxy via `boxd machine proxy new`. This
 #     script points the *default* proxy at Hermes Studio and adds a
 #     "router" subdomain proxy for 9Router.
 #   - The boxd default image already ships curl, wget, git,
@@ -742,17 +742,24 @@ if [ "$HAVE_BOXD_CLI" = true ]; then
     if boxd machine proxy set-port --port "${HERMES_PORT}" &>/tmp/boxd-proxy-hermes.log; then
         log "Default proxy now points at Hermes Studio (port ${HERMES_PORT})."
     else
-        warn "Could not set the default proxy port - see /tmp/boxd-proxy-hermes.log"
+        warn "Could not set the default proxy port:"
+        sed 's/^/    /' /tmp/boxd-proxy-hermes.log
     fi
 
-    if boxd machine proxy add router --port "${ROUTER_PORT}" &>/tmp/boxd-proxy-router.log; then
+    # NOTE: the real subcommand is `new`, not `add` - `boxd machine
+    # proxy --help` on the actual installed binary is the source of
+    # truth here (confirmed against a live boxd VM), overriding an
+    # earlier/inconsistent doc snippet that showed `add`.
+    if boxd machine proxy new router --port "${ROUTER_PORT}" &>/tmp/boxd-proxy-router.log; then
         log "Added subdomain proxy 'router' for 9Router (port ${ROUTER_PORT})."
+    elif grep -qi 'already exists' /tmp/boxd-proxy-router.log; then
+        info "Proxy 'router' already exists from a previous run - leaving it as is."
     else
-        # Proxy may already exist from a previous run - not fatal.
-        warn "Could not add the 'router' proxy (it may already exist) - see /tmp/boxd-proxy-router.log"
+        warn "Could not create the 'router' proxy:"
+        sed 's/^/    /' /tmp/boxd-proxy-router.log
     fi
 else
-    warn "Skipping proxy setup - boxd CLI not available. Expose the ports manually with 'boxd machine proxy set-port' / 'boxd machine proxy add' once you're on a real boxd VM."
+    warn "Skipping proxy setup - boxd CLI not available. Expose the ports manually with 'boxd machine proxy set-port' / 'boxd machine proxy new' once you're on a real boxd VM."
 fi
 
 # ============================================================
