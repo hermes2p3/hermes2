@@ -295,7 +295,28 @@ else
     /opt/hermes-venv/bin/pip install --upgrade pip -q
     log "Installing hermes-agent..."
     /opt/hermes-venv/bin/pip install 'hermes-agent>=0.18' -q
-    ln -sf /opt/hermes-venv/bin/hermes /usr/local/bin/hermes
+
+    # A plain symlink to the venv binary isn't enough here: the
+    # running services are started with HERMES_HOME=/root/.hermes
+    # exported explicitly, but a bare `hermes` invocation has no such
+    # env var and falls back to $HOME/.hermes - which is
+    # /home/boxd/.hermes for the `boxd` user, an entirely different
+    # (empty) directory. That mismatch is what makes commands like
+    # `hermes pairing approve telegram <code>` fail with "not found or
+    # expired" (or quietly rack up failed attempts and lock the
+    # platform out) when run directly by the boxd user instead of
+    # through this script. This wrapper pins HERMES_HOME to the real
+    # config dir and re-execs with sudo if needed, so the command
+    # behaves the same regardless of which user calls it.
+    cat > /usr/local/bin/hermes << 'HERMES_WRAPPER_EOF'
+#!/bin/bash
+export HERMES_HOME=/root/.hermes
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -E "$0" "$@"
+fi
+exec /opt/hermes-venv/bin/hermes "$@"
+HERMES_WRAPPER_EOF
+    chmod +x /usr/local/bin/hermes
     log "hermes-agent installed: $(/opt/hermes-venv/bin/hermes --version 2>&1 | head -1)"
 fi
 
